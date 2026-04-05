@@ -237,6 +237,7 @@ class RemoteAgentClient:
             resp.raise_for_status()
             yield from parse_sse_stream(resp)
 
+
     def list_investigations(self, *, timeout: float = REQUEST_TIMEOUT) -> list[dict[str, Any]]:
         """GET the list of persisted investigation ``.md`` files."""
         url = f"{self.base_url}/investigations"

@@ -281,6 +281,7 @@ def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
     )
 
 
+
 @app.get("/investigations", response_model=list[InvestigationMeta])
 def list_investigations() -> list[InvestigationMeta]:
     """List all persisted investigation ``.md`` files."""

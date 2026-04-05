@@ -738,9 +738,7 @@ def remote_investigate(ctx: click.Context, alert_json: str | None, sample: bool)
 
     resolved_url = url or load_remote_url()
     if not resolved_url:
-        raise click.ClickException(
-            "No remote URL configured. Pass --url or run 'opensre remote health <url>'."
-        )
+        raise click.ClickException("No remote URL configured. Pass --url or run 'opensre remote health <url>'.")
 
     raw_alert: dict
     if alert_json:
@@ -769,9 +767,7 @@ def remote_investigate(ctx: click.Context, alert_json: str | None, sample: bool)
         renderer.render_stream(events)
         save_remote_url(client.base_url)
     except httpx.TimeoutException as exc:
-        raise click.ClickException(
-            f"Connection timed out reaching {client.base_url}."
-        ) from exc
+        raise click.ClickException(f"Connection timed out reaching {client.base_url}.") from exc
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(f"Remote investigation failed: {exc}") from exc
 
