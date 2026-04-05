@@ -11,9 +11,14 @@ Start with::
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
-from collections.abc import AsyncIterator
+import threading
+import traceback
+import uuid
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +27,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from app.version import get_version
 
@@ -127,6 +133,151 @@ def investigate(req: InvestigateRequest) -> InvestigateResponse:
         report=result.get("report", ""),
         root_cause=result.get("root_cause", ""),
         problem_md=result.get("problem_md", ""),
+    )
+
+
+_HEARTBEAT_INTERVAL = 15.0
+_FIELDS_TO_SKIP = frozenset({"messages", "_auth_token"})
+
+
+def _safe_json(obj: Any) -> str:
+    """JSON-serialize with fallback to str() for non-serializable types."""
+    return json.dumps(obj, default=str)
+
+
+def _sse_event(event_type: str, data: dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {_safe_json(data)}\n\n"
+
+
+def _filter_state_update(update: dict[str, Any]) -> dict[str, Any]:
+    """Remove fields that are non-serializable or sensitive."""
+    return {k: v for k, v in update.items() if k not in _FIELDS_TO_SKIP}
+
+
+@app.post("/investigate/stream")
+def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
+    """Run an investigation with SSE streaming progress."""
+    logger = logging.getLogger(__name__)
+    run_id = str(uuid.uuid4())
+
+    def event_generator() -> Iterator[str]:
+        from app.cli.investigate import resolve_investigation_context
+        from app.config import LLMSettings
+        from app.output import reset_tracker
+        from app.state import make_initial_state
+
+        old_format = os.environ.get("TRACER_OUTPUT_FORMAT")
+        os.environ["TRACER_OUTPUT_FORMAT"] = "json"
+        reset_tracker()
+
+        try:
+            yield _sse_event("metadata", {"run_id": run_id})
+
+            alert_name_resolved, pipeline_resolved, severity_resolved = (
+                resolve_investigation_context(
+                    raw_alert=req.raw_alert,
+                    alert_name=req.alert_name,
+                    pipeline_name=req.pipeline_name,
+                    severity=req.severity,
+                )
+            )
+
+            LLMSettings.from_env()
+            initial = make_initial_state(
+                alert_name_resolved,
+                pipeline_resolved,
+                severity_resolved,
+                raw_alert=req.raw_alert,
+            )
+
+            from app.pipeline.graph import build_graph
+
+            graph = build_graph()
+            final_state: dict[str, Any] = {}
+            current_node = ""
+
+            heartbeat_stop = threading.Event()
+            heartbeat_lines: list[str] = []
+
+            def _heartbeat_loop() -> None:
+                while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    heartbeat_lines.append(": heartbeat\n\n")
+
+            heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
+
+            try:
+                for chunk in graph.stream(initial):
+                    if not isinstance(chunk, dict):
+                        continue
+
+                    while heartbeat_lines:
+                        yield heartbeat_lines.pop(0)
+
+                    for node_name, node_update in chunk.items():
+                        if node_name.startswith("__"):
+                            continue
+                        current_node = node_name
+                        filtered = (
+                            _filter_state_update(node_update)
+                            if isinstance(node_update, dict)
+                            else {}
+                        )
+                        final_state.update(filtered)
+                        yield _sse_event("updates", {node_name: filtered})
+            except Exception as exc:
+                tb = traceback.format_exc()
+                logger.error(
+                    "Investigation stream failed at node %s: %s\n%s",
+                    current_node,
+                    exc,
+                    tb,
+                )
+                yield _sse_event(
+                    "error",
+                    {
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "node": current_node,
+                        "run_id": run_id,
+                        "retryable": False,
+                    },
+                )
+                return
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=2.0)
+
+            inv_id = _make_id(alert_name_resolved)
+            try:
+                _save_investigation(
+                    inv_id=inv_id,
+                    alert_name=alert_name_resolved,
+                    pipeline_name=pipeline_resolved,
+                    severity=severity_resolved,
+                    result={
+                        "report": final_state.get(
+                            "slack_message", final_state.get("report", "")
+                        ),
+                        "root_cause": final_state.get("root_cause", ""),
+                        "problem_md": final_state.get("problem_md", ""),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist investigation: %s", exc)
+
+            yield _sse_event("end", {"run_id": run_id, "id": inv_id})
+
+        finally:
+            if old_format is not None:
+                os.environ["TRACER_OUTPUT_FORMAT"] = old_format
+            elif "TRACER_OUTPUT_FORMAT" in os.environ:
+                del os.environ["TRACER_OUTPUT_FORMAT"]
+            reset_tracker()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

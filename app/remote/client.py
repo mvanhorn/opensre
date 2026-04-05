@@ -207,6 +207,36 @@ class RemoteAgentClient:
             result: dict[str, Any] = resp.json()
             return result
 
+    def investigate_stream(
+        self,
+        raw_alert: dict[str, Any],
+        *,
+        alert_name: str | None = None,
+        pipeline_name: str | None = None,
+        severity: str | None = None,
+        timeout: float = STREAM_TIMEOUT,
+    ) -> Iterator[StreamEvent]:
+        """POST an alert to the lightweight server and stream SSE progress.
+
+        Yields StreamEvent objects as nodes complete. The first event is
+        ``metadata`` carrying the server-assigned ``run_id``.
+        """
+        url = f"{self.base_url}/investigate/stream"
+        body: dict[str, Any] = {"raw_alert": raw_alert}
+        if alert_name:
+            body["alert_name"] = alert_name
+        if pipeline_name:
+            body["pipeline_name"] = pipeline_name
+        if severity:
+            body["severity"] = severity
+
+        with (
+            httpx.Client(timeout=httpx.Timeout(timeout, connect=REQUEST_TIMEOUT)) as client,
+            client.stream("POST", url, json=body, headers=self._headers) as resp,
+        ):
+            resp.raise_for_status()
+            yield from parse_sse_stream(resp)
+
     def list_investigations(self, *, timeout: float = REQUEST_TIMEOUT) -> list[dict[str, Any]]:
         """GET the list of persisted investigation ``.md`` files."""
         url = f"{self.base_url}/investigations"

@@ -726,18 +726,21 @@ def remote_trigger(ctx: click.Context, alert_json: str | None) -> None:
 @click.option("--sample", is_flag=True, default=False, help="Use the built-in sample alert payload.")
 @click.pass_context
 def remote_investigate(ctx: click.Context, alert_json: str | None, sample: bool) -> None:
-    """Run an investigation on the lightweight remote server."""
+    """Run an investigation on the lightweight remote server with streaming progress."""
     import httpx
 
     from app.cli.wizard.store import load_remote_url, save_remote_url
     from app.remote.client import RemoteAgentClient
+    from app.remote.renderer import StreamRenderer
 
     url = ctx.obj.get("url")
     api_key = ctx.obj.get("api_key")
 
     resolved_url = url or load_remote_url()
     if not resolved_url:
-        raise click.ClickException("No remote URL configured. Pass --url or run 'opensre remote health <url>'.")
+        raise click.ClickException(
+            "No remote URL configured. Pass --url or run 'opensre remote health <url>'."
+        )
 
     raw_alert: dict
     if alert_json:
@@ -760,19 +763,15 @@ def remote_investigate(ctx: click.Context, alert_json: str | None, sample: bool)
 
     client = RemoteAgentClient(resolved_url, api_key=api_key)
 
-    click.echo("Sending investigation request (this may take a few minutes)...")
     try:
-        result = client.investigate(raw_alert)
+        events = client.investigate_stream(raw_alert)
+        renderer = StreamRenderer()
+        renderer.render_stream(events)
         save_remote_url(client.base_url)
-        click.echo(f"\n  Investigation ID: {result.get('id', 'N/A')}")
-        root_cause = result.get("root_cause", "")
-        if root_cause:
-            click.echo(f"\n  Root Cause:\n  {root_cause}")
-        report = result.get("report", "")
-        if report:
-            click.echo(f"\n  Report:\n  {report}")
     except httpx.TimeoutException as exc:
-        raise click.ClickException(f"Connection timed out: {exc}") from exc
+        raise click.ClickException(
+            f"Connection timed out reaching {client.base_url}."
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(f"Remote investigation failed: {exc}") from exc
 

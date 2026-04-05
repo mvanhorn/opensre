@@ -22,6 +22,7 @@ _DIM = "\033[2m"
 _BOLD = "\033[1m"
 _WHITE = "\033[37m"
 _CYAN = "\033[1;36m"
+_RED = "\033[1;31m"
 
 
 class StreamRenderer:
@@ -38,6 +39,8 @@ class StreamRenderer:
         self._node_names_seen: list[str] = []
         self._final_state: dict[str, Any] = {}
         self._stream_completed = False
+        self._run_id: str = ""
+        self._error_message: str = ""
 
     @property
     def events_received(self) -> int:
@@ -55,12 +58,16 @@ class StreamRenderer:
     def stream_completed(self) -> bool:
         return self._stream_completed
 
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
     def render_stream(self, events: Iterator[StreamEvent]) -> dict[str, Any]:
         """Consume a full event stream and render progress to the terminal.
 
         Returns the accumulated final state dict.
         """
-        _print_connection_banner()
+        _print_connection_banner(self._run_id)
 
         for event in events:
             self._handle_event(event)
@@ -73,6 +80,7 @@ class StreamRenderer:
         self._events_received += 1
 
         if event.event_type == "metadata":
+            self._run_id = event.data.get("run_id", "")
             return
 
         if event.event_type == "end":
@@ -80,9 +88,23 @@ class StreamRenderer:
             self._finish_active_node()
             return
 
+        if event.event_type == "error":
+            self._handle_error(event)
+            return
+
         if event.event_type == "updates":
             self._handle_update(event)
             return
+
+    def _handle_error(self, event: StreamEvent) -> None:
+        self._finish_active_node()
+        node = event.data.get("node", "")
+        message = event.data.get("message", "Unknown error")
+        run_id = event.data.get("run_id", self._run_id)
+        self._error_message = message
+        if node:
+            self._tracker.error(node, message)
+        _print_error(message, run_id)
 
     def _handle_update(self, event: StreamEvent) -> None:
         node = event.node_name
@@ -128,6 +150,9 @@ class StreamRenderer:
         return None
 
     def _print_report(self) -> None:
+        if self._error_message:
+            return
+
         alert_name = self._final_state.get("alert_name", "Unknown")
         pipeline = self._final_state.get("pipeline_name", "Unknown")
         severity = self._final_state.get("severity", "unknown")
@@ -160,14 +185,16 @@ def _canonical_node_name(name: str) -> str:
     return mapping.get(name, name)
 
 
-def _print_connection_banner() -> None:
+def _print_connection_banner(run_id: str = "") -> None:
+    suffix = f"  {_DIM}run {run_id[:8]}{_RESET}" if run_id else ""
     if get_output_format() == "rich":
         sys.stdout.write(
             f"\n  {_BOLD}{_CYAN}Remote Investigation{_RESET}"
-            f"  {_DIM}streaming from deployed agent{_RESET}\n\n"
+            f"  {_DIM}streaming from deployed agent{_RESET}{suffix}\n\n"
         )
     else:
-        print("\n  Remote Investigation  streaming from deployed agent\n")
+        rid = f"  run {run_id[:8]}" if run_id else ""
+        print(f"\n  Remote Investigation  streaming from deployed agent{rid}\n")
     sys.stdout.flush()
 
 
@@ -180,6 +207,19 @@ def _print_section(title: str, content: str) -> None:
         print(f"\n  {title}")
         for line in content.strip().splitlines():
             print(f"  {line}")
+    sys.stdout.flush()
+
+
+def _print_error(message: str, run_id: str = "") -> None:
+    rid = f" (run {run_id[:8]})" if run_id else ""
+    if get_output_format() == "rich":
+        sys.stdout.write(
+            f"\n  {_BOLD}{_RED}Investigation failed{_RESET}{rid}\n"
+            f"  {_DIM}{message}{_RESET}\n"
+        )
+    else:
+        print(f"\n  Investigation failed{rid}")
+        print(f"  {message}")
     sys.stdout.flush()
 
 
